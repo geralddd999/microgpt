@@ -39,7 +39,7 @@ n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-block_size = 8
+# block_size = 8
 
 train_data[:block_size+1] #targets for each position
 
@@ -54,8 +54,8 @@ for t in range(block_size):
 # Creating the dataloaders | to allow us to process multiple chunks batches at the same time
 
 torch.manual_seed(1337)
-batch_size =4 # n fo independent sequences will we process in parallel
-block_size = 8 # max-context len for preds
+# batch_size =4 # n fo independent sequences will we process in parallel
+# block_size = 8 # max-context len for preds
 
 def get_batch(split : str):
     #generate a small batch of data of inputs x an targets y
@@ -109,8 +109,8 @@ class Evaluator:
         X, Y = get_batch(split)
         _, loss = self.model(X,Y)
         losses[k] = loss.item()
-        out[split] = losses.mean()
-        self.model.train()
+      out[split] = losses.mean()
+    self.model.train()
 
     return out
 

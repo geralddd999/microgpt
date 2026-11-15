@@ -3,13 +3,16 @@
 import torch
 
 # Experience hyperparameters
-batch_size = 32
-block_size = 8
+batch_size = 32*2
+block_size = 256
 max_iters = 5000
 eval_interval = 300
-learning_rate = 1e-3 #self-attention can't tolerate a high lr
+learning_rate = 3e-4 #self-attention can't tolerate a high lr
 eval_iters = 200
-n_embed = 32
+n_embed = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2 # 20% of the intermediate calcs are disabled
 
 with open('input.txt','r', encoding = 'utf-8') as f :
     text = f.read()
@@ -39,8 +42,6 @@ print(data[:1000])
 n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
-
-block_size = 8
 
 train_data[:block_size+1] #targets for each position
 
@@ -127,34 +128,58 @@ class FeedForward(nn.Module):
   def __init__(self, n_embed):
     super().__init__()
     self.net = nn.Sequential(
-      nn.Linear(n_embed, n_embed),
+      nn.Linear(n_embed, 4*n_embed),
       nn.ReLU(),
+      nn.Linear(4*n_embed, n_embed),
+      nn.Dropout(dropout) # randomly shuts off a subset of neurons, prevents overfitting
     )
 
   def forward(self, x):
     return self.net(x)
 
+class Block(nn.Module):
+  """
+  Follows the Transformer stack, we have a module that does the communication that is followed by the computation
+  """
 
+  def __init__(self, n_embed, n_head):
+    super().__init__()
+    head_size = n_embed//n_head
+    self.sa = MultiHeadAttention(n_head, head_size) # communication between tokens
+    self.ffwd = FeedForward(n_embed) # computation
+    self.ln1 = nn.LayerNorm(n_embed)
+    self.ln2 = nn.LayerNorm(n_embed)
+  def forward(self,x):
+    """ Adds a residual connection to optimize the training """
+    x = x + self.sa(self.ln1(x)) # applies layernorm before the transformation [pertoken transformations, makes then unit gaussian at init that can later be updated]
+    x = x + self.ffwd(self.ln2(x))
+    return x
 class BigramLanguageModel(nn.Module):
-  """ Bigram as in pair of two, the model only every looks at pairs liek the current and the next character; meaning that it doesnt have this notion of context of the previous tokens; aka no memory"""
+  """ decoder_only implementation of a transformer"""
 
   def __init__(self):
     super().__init__()
     # each token reads of the logits for the next token from a lookup table  -  aka a embedding table
     self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
     self.position_embedding_table = nn.Embedding(block_size, n_embed)
-    # pass from a single comm channel to 4 ;
-    self.sa_heads = MultiHeadAttention(4, n_embed//4) # we have 4 heads from each C we will get 8 overall after cat we will get 32 C
+    # pass from a single comm channel to multiple ;
+    self.blocks = nn.Sequential(
+      *[Block(n_embed, n_head = n_head) for _ in range(n_layer)]
+    )
+    self.ln_f = nn.LayerNorm(n_embed)
     self.lm_head = nn.Linear(n_embed, vocab_size)
 
 
   def forward(self, idx, targets = None):
+    # genral idea : communicate and then compute
+    #
     B,T = idx.shape
     #idx and targets are both (B,T) tensor of integers
     tok_emb = self.token_embedding_table(idx) #(B, T, C)
     pos_emb = self.position_embedding_table(torch.arange(T)) #integers from 0 to T-1 that will be embedded through the table -> (T,C)
     x = tok_emb + pos_emb #(B,T, C) holds the token id + positions
-    x = self.sa_heads(x) # apply the head of attention
+    x = self.blocks(x) # apply the head of attention
+    x = self.ln_f(x) # (BTC)
     logits = self.lm_head(x) # (B,T,vocab_size)
 
     if targets is None :
@@ -192,14 +217,17 @@ class Head(nn.Module):
 
      self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+     self.dropout = nn.Dropout(dropout)
+
   def forward(self, x):
     B, T, C = x.shape
     k = self.key(x)
     q = self.query(x)
     # compute the attention scores
-    wei = q @ k.transpose(-2,-1) * C**-0.5
+    wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
     wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
     wei = F.softmax(wei, dim=-1)
+    wei = self.dropout(wei)
     v = self.value(x)
 
     out = wei @ v # (B, T ,T ) @ (B, T, C) -> (BTC)
@@ -213,9 +241,14 @@ class MultiHeadAttention(nn.Module):
   def __init__(self, num_heads, head_size):
     super().__init__()
     self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
+    self.proj = nn.Linear(n_embed, n_embed)
+    self.dropout = nn.Dropout(dropout)
 
   def forward(self, x):
-    return torch.cat([h(x) for h in self.heads], dim = -1) # cat over the channel dimension
+    out = torch.cat([h(x) for h in self.heads], dim = -1)
+    out = self.proj(out) # linear transformation of the heads output
+    out = self.dropout(out)
+    return out
 
 model = BigramLanguageModel()
 logits, loss = model(xb,yb)
@@ -230,7 +263,7 @@ print(decode(model.generate(idx, max_new_tokens= 100)[0].tolist()))
 # training loop \ cmmon?
 # ==========
 
-optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr = learning_rate)
 evaluator = Evaluator(model, eval_interval, eval_iters)
 for iter in range(max_iters):
 
